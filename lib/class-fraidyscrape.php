@@ -1,20 +1,18 @@
 <?php
 namespace Fraidyscrape;
-use \Sabre\Uri;
+use Sabre\Uri;
+use JsonPath\JsonObject;
 
 require_once dirname( __DIR__ ) . '/vendor/autoload.php';
 
 function varr( $vars, $x ) {
-	$k = explode( ':', $x );
-	$vars = array();
 	foreach ( explode( ':', $x ) as $var ) {
 		if ( isset( $vars[ $var ] ) ) {
-			$vars = $vars[ $var ];
+			$vars = &$vars[ $var ];
 		} else {
 			return '';
 		}
 	}
-
 	return empty( $vars ) ? '' : $vars;
 }
 
@@ -25,7 +23,7 @@ function varx( $str, $vars ) {
 
 	$str = preg_replace_callback(
 		'/\${(.+)}/',
-		function ( $x ) {
+		function ( $x ) use ( $vars ) {
 			$k = array_slice( $x, 2, -1 );
 			$v = varx( $k, $vars );
 			return varr( $vars, $v );
@@ -35,16 +33,15 @@ function varx( $str, $vars ) {
 
 	$str = preg_replace_callback(
 		'/\$([:\w]+)/',
-		function ( $x ) {
-			return varr( $vars, array_slice( 1 ) );
+		function ( $x ) use ( $vars ) {
+			return varr( $vars, $x[1] );
 		},
 		$str
 	);
-
 	return $str;
 }
 
-class Fraidyscrape {
+class Scraper {
 	private $defs;
 	function __construct( $defs ) {
 		$this->defs = $defs;
@@ -145,11 +142,11 @@ class Fraidyscrape {
 				foreach ( $site->arguments as $i => $argument ) {
 					if ( is_string( $argument ) ) {
 						$vars[ $argument ] = $match[ $i ];
-					} elseif ( is_object( $argument ) ) {
+					} elseif ( is_array( $argument ) ) {
 						$vars = $this->assign(
 							$vars,
 							array(
-								$argument->var => $match[ $i ],
+								$argument['var'] => $match[ $i ],
 							),
 							$vars,
 							isset( $argument->mod ) ? $argument->mod : null,
@@ -206,7 +203,11 @@ class Fraidyscrape {
 
 		$url = parse_url( $options['url'] );
 		if ( isset( $options['query'] ) ) {
-			$url['query'] = $options['query'];
+			$url['query'] = array();
+			foreach ( $options['query'] as $key => $val ) {
+				$url['query'][] = urlencode( $key ) . '=' . urlencode( $val );
+			}
+			$url['query'] = implode( '&', $url['query'] );
 			unset( $options['query'] );
 		}
 
@@ -215,5 +216,264 @@ class Fraidyscrape {
 			'options' => $options,
 			'render' => ! empty( $req['render'] ) ? $req['render'] : null,
 		);
+	}
+
+	public function parseHtml( $str, $mime_type ) {
+		$dom = new DOMDocument();
+		if ( false !== strpos( $mime_type, 'html' ) ) {
+			$dom->loadHtml( $str );
+		} else {
+			$dom->loadXml( $str );
+		}
+		return $dom;
+	}
+
+	public function scrape( $tasks, $req, $res ) {
+		$site = $this->defs[ $req['id'] ];
+		$vars = $this->scrapeRule( $tasks, $res, $site );
+		$vars['rule'] = $req['id'];
+		return $vars;
+	}
+
+	public function scrapeRule( $tasks, $res, $site ) {
+		$body = wp_remote_retrieve_body( $res );
+		$mime = wp_remote_retrieve_header( $res, 'content-type' );
+
+		if ( preg_match( '/^\s*[{\[]/', $body ) ) {
+			$tasks->vars['doc'] = json_decode( $body );
+			if ( is_array( $tasks->vars['doc'] ) ) {
+				$tasks->vars['doc'] = array( 'list' => $tasks->vars['doc'] );
+			}
+			$mime = 'application/json';
+		} elseif ( preg_match( '/^\s*</m',  $body ) ) {
+		    // The [\s\S] matches ANY char - while the dot (,) doesn't match newlines
+			if ( preg_match( '/^\s*<\?xml\s+[\s\S]+<(rss|atom)/i', $body ) ) {
+				$mime = 'text/xml';
+			}
+			$tasks->vars['doc'] = $this->parseHtml( $body, $mime );
+		} else {
+			$mime = 'text/plain';
+			$tasks->vars['doc'] = $body;
+		}
+		$tasks->vars['mime'] = $mime;
+
+
+		$vars = $this->scanSite( $tasks->vars, $site, $tasks->vars['doc'] );
+		unset( $tasks->vars['doc'] );
+		return $vars;
+	}
+
+	public function scanSite( &$vars, $site, $obj ) {
+		$oldNs = $vars['namespaces'];
+		$oldRules = $vars['rules'];
+
+		$vars['namespaces'] = $site['namespaces'];
+		$vars['rules'] = $site['rules'];
+
+		$v = $this->scan( $vars, $site, $obj );
+
+		$site['namespaces'] = $oldNs;
+		$site['rules'] = $oldRules;
+
+		return $v;
+	}
+
+	public function scan( &$vars, $site, $obj ) {
+		$script = null;
+		$fn = function ( $path, $asText ) use ( $obj ) {
+			$jsonObject = new jsonObject( $obj );
+			$r = $jsonObject->get( $path );
+			if ( $asText ) {
+				return array_shift( $r );
+			}
+
+			return $r;
+		};
+
+		if ( isset( $site['accept'] ) ) {
+			foreach ( $site['accept'] as $accept ) {
+				$this->scanSite( $vars, $this->defs[ $accept ], $obj );
+				if ( isset( $vars['out'] ) ) {
+					break;
+				}
+			}
+		}
+
+		if ( isset( $site['acceptJson'] ) ) {
+			if ( is_string( $obj ) ) {
+				$vars['mime'] = 'application/json';
+				$obj = json_decode( $obj );
+			} elseif ( ! isset( $vars['mime'] ) ) {
+				$vars['mime'] = 'application/json';
+			} elseif ( $vars['mime'] !== 'application/json' ) {
+				return $vars;
+			}
+			$script = $site['acceptJson'];
+		} elseif ( isset( $site['acceptText'] ) ) {
+			// if (obj.innerText) {
+			// 	obj = obj.innerText
+			// }
+			if ( is_string( $obj ) && ! isset( $vars['mime'] ) ) {
+				$vars['mime'] = 'text/plain';
+			} elseif ( $vars['mime'] !== 'text/plain' ) {
+				return $vars;
+			}
+			$obj = strval( $obj );
+			$script = $site['acceptText'];
+			$fn = function ( $path, $asText ) use ( $obj ) {
+				if ( $asText ) {
+					if ( preg_match( '/' . preg_quote( $path, '/' ) . '/m', $match ) ) {
+						return isset( $match[1] ) ? $match[1] : $obj;
+					}
+					return null;
+				}
+
+				preg_match_all( '/' . preg_quote( $path, '/' ) . '/m', $matches, PREG_SET_ORDER );
+				return $matches;
+			};
+		} elseif ( isset( $site['acceptHtml'] ) || isset( $site['acceptXml'] ) ) {
+			if ( is_string( $obj ) || ! isset( $vars['mime' ]) ) {
+				$vars['mime'] = isset( $site['acceptHtml'] ) ? 'text/html' : 'text/xml';
+			} elseif ( $vars['mime'] === 'application/json' ) {
+				return $vars;
+			}
+			$script = isset( $site['acceptHtml'] ) ? $site['acceptHtml'] : $site['acceptXml'];
+			$fn = function ( $path, $asText ) use ( $obj, $vars ) {
+				if ( ! is_array( $path ) ) {
+				  $path = array( $path );
+				}
+
+				$xpath = new DomXPath( $obj );
+				foreach ( $vars['namespaces'] as $prefix => $namespace ) {
+					$xpath->registerNamespace( $prefix, $namespace );
+				}
+				foreach ( $path as $p ) {
+					$list = $xpath->query( $p );
+					if ( 0 === count( $list ) ) {
+						continue;
+					}
+
+					if ( $asText ) {
+						return trim( implode( '', $list ) );
+					}
+					return $list;
+				}
+				return $asText ? "" : array();
+			};
+		} elseif ( isset( $site['patch'] ) ) {
+			$script = $site['patch'];
+			if ( ! $site['op'] ) {
+				$obj = $vars['out'];
+			}
+		}
+
+		if ( $script ) {
+			if ( is_array( $obj ) ) {
+				$out = array();
+				if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
+					unset( $vars['out'] );
+				}
+				foreach ( $obj as $i => $el ) {
+					$v = ( isset( $site['var'] ) && '*' === $site['var'] ) ? $vars : clone $vars;
+					$v['index'] = $i;
+					$this->scan( $v, $site, $el );
+					if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
+						$out[] = $v['out'];
+					}
+				}
+				if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
+					$vars['out'] = $out;
+				}
+
+			} elseif ( $fn ) {
+				$this->scanScript( $vars, $script, $obj, $fn );
+			}
+		}
+
+		return $vars;
+	}
+
+	public function scanScript( & $vars, $script, $node, $pathFn ) {
+		foreach ( $script as $cmd ) {
+			if ( isset( $cmd['rule'] ) ) {
+				$rule = isset( $vars['rules'][ $cmd['rule'] ] ) ? $vars['rules'][ $cmd['rule'] ] : null;
+				if ( $rule ) {
+					$this->scanScript( $vars, $rule, $node, $pathFn );
+				}
+			}
+
+			$ops = $cmd['op'];
+			$val = null;
+			if ( ! is_array( $ops ) ) {
+				$ops = array( $ops );
+			}
+
+			foreach ( $ops as $op ) {
+				$op = varx( $op, $vars );
+				if ( ! $op ) {
+					continue;
+				}
+
+				$hasChildren = isset( $cmd['acceptJson'] ) || isset( $cmd['acceptText'] ) || isset( $cmd['acceptHtml'] ) || isset( $cmd['acceptXml'] ) || isset( $cmd['patch'] ) || isset( $cmd['use'] );
+				$asText = ( ! $hasChildren && ! $cmd['match'] );
+
+				if ( '=' === $op[0] ) {
+					$val = substr( $op, 1 );
+				} elseif ( '&' === $op[0] ) {
+					$jsonObject = new jsonObject( $vars );
+					$val = $jsonObject->get( '$' . substr( $op, 1 ) );
+					if ( $asText ) {
+						$val = array_shift( $val );
+					}
+				} else {
+					$val = $pathFn( $op, $asText );
+				}
+
+				if ( isset( $cmd['match'] ) ) {
+					if ( $val['match'] && preg_match( '/' . preg_quote( $cmd['match'], '/' ) . '/', $val, $match ) ) {
+						$val = isset( $match[1] ) ? $match[1] : $val;
+					} else {
+						continue;
+					}
+				}
+
+				if ( isset( $this->defs[ $cmd['use'] ] ) && strlen( $val ) > 0 ) {
+					$use = $this->defs[ $cmd['use'] ];
+					return $this->scanSite( $vars, $use, $node );
+				}
+
+				// If there is a nested ruleset, process it.
+				if ( $hasChildren ) {
+					if ( isset( $cmd['var'] ) ) {
+						if ( '*' !== $cmd['var'] ) {
+							$v = clone $vars; // ?
+							unset( $vars['out'] );
+						}
+					} elseif ( is_array( $val ) ) {
+						$val = array_shift( $val );
+					}
+
+					if ( $val ) {
+						$this->scan( $vars, $cmd, $val );
+					}
+
+					if ( isset( $cmd['var'] ) && '*' !== $cmd['var'] ) {
+						$val = $vars['out'];
+						$vars = $v;
+					}
+				}
+
+				// If object contains anything at all, no need to run
+				// further ops in a chain.
+				if ( $val ) {
+					break;
+				}
+			}
+
+			// See 'assign' method above.
+			if ( isset( $cmd['var'] ) && '*' !== $cmd['var'] ) {
+				$vars = $this->assign( $vars, array( $cmd['var'] => $val ), $vars, isset( $cmd['mod'] ) ? $cmd['mod'] : null, true );
+			}
+		}
 	}
 }
