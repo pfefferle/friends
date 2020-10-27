@@ -1,4 +1,10 @@
 <?php
+/**
+ * This is a PHP port of Fraidyscrape
+ *
+ * https://github.com/kickscondor/fraidyscrape
+ */
+
 namespace Fraidyscrape;
 use Sabre\Uri;
 use JsonPath\JsonObject;
@@ -24,8 +30,7 @@ function varx( $str, $vars ) {
 	$str = preg_replace_callback(
 		'/\${(.+)}/',
 		function ( $x ) use ( $vars ) {
-			$k = array_slice( $x, 2, -1 );
-			$v = varx( $k, $vars );
+			$v = varx( $x[1], $vars );
 			return varr( $vars, $v );
 		},
 		$str
@@ -39,6 +44,28 @@ function varx( $str, $vars ) {
 		$str
 	);
 	return $str;
+}
+
+function endsWith( $haystack, $needle ) {
+    return substr( $haystack, - strlen( $needle ) ) === $needle;
+}
+
+function transformXpath( $path ) {
+	if ( endsWith( $path, 'text()' ) ) {
+		$path = rtrim( substr( $path, 0, -6 ), '/' );
+	}
+	return $path;
+}
+
+function jsonPath( $obj, $path, $asText ) {
+	$jsonObject = new jsonObject( $obj );
+	$r = $jsonObject->get( $path );
+
+	if ( $asText ) {
+		return array_shift( $r );
+	}
+
+	return $r;
 }
 
 class Scraper {
@@ -80,8 +107,9 @@ class Scraper {
 								$val = $val . ', ' . date( 'Y' );
 							}
 						}
-
-						$val = new DateTime( $val );
+						if ( $val ) {
+							$val = new \DateTime( $val );
+						}
 					} elseif ( 'int' === $trans ) {
 						$val = intval( $val );
 					} elseif ( 'slug' === $trans ) {
@@ -219,9 +247,9 @@ class Scraper {
 	}
 
 	public function parseHtml( $str, $mime_type ) {
-		$dom = new DOMDocument();
+		$dom = new \DOMDocument();
 		if ( false !== strpos( $mime_type, 'html' ) ) {
-			$dom->loadHtml( $str );
+			@$dom->loadHtml( $str );
 		} else {
 			$dom->loadXml( $str );
 		}
@@ -281,13 +309,8 @@ class Scraper {
 	public function scan( &$vars, $site, $obj ) {
 		$script = null;
 		$fn = function ( $path, $asText ) use ( $obj ) {
-			$jsonObject = new jsonObject( $obj );
-			$r = $jsonObject->get( $path );
-			if ( $asText ) {
-				return array_shift( $r );
-			}
-
-			return $r;
+			$path = str_replace( array( '===', '!==' ), array( '==', '!=' ), $path );
+			return jsonPath( $obj, $path, $asText );
 		};
 
 		if ( isset( $site['accept'] ) ) {
@@ -298,7 +321,6 @@ class Scraper {
 				}
 			}
 		}
-
 		if ( isset( $site['acceptJson'] ) ) {
 			if ( is_string( $obj ) ) {
 				$vars['mime'] = 'application/json';
@@ -343,22 +365,55 @@ class Scraper {
 				  $path = array( $path );
 				}
 
-				$xpath = new DomXPath( $obj );
-				foreach ( $vars['namespaces'] as $prefix => $namespace ) {
-					$xpath->registerNamespace( $prefix, $namespace );
+				$xpath = new \DomXPath( $vars['doc'] );
+				if ( is_array( $vars['namespaces'] ) ) {
+					foreach ( $vars['namespaces'] as $prefix => $namespace ) {
+						$xpath->registerNamespace( $prefix, $namespace );
+					}
 				}
+
 				foreach ( $path as $p ) {
-					$list = $xpath->query( $p );
-					if ( 0 === count( $list ) ) {
-						continue;
+					$p = transformXpath( $p );
+					$list = array(); // Reset to array in case it was an empty DOMNodeList
+					if ( $obj instanceof \DOMNodeList ) {
+						foreach ( $obj as $node ) {
+							$domnodelist = $xpath->query( $p, $node );
+							if ( count( $domnodelist ) ) {
+								foreach ( $domnodelist as $domnode ) {
+									$list[] = $domnode;
+								}
+							}
+						}
+					} else {
+						$list = $xpath->query( $p, $obj );
 					}
 
-					if ( $asText ) {
-						return trim( implode( '', $list ) );
+					if ( count( $list ) > 0 ) {
+						break;
 					}
-					return $list;
 				}
-				return $asText ? "" : array();
+
+				if ( 0 === count( $list ) ) {
+					return $asText ? '' : array();
+				}
+
+				if ( $asText ) {
+					$domlist = $list;
+					$list = array();
+					foreach ( $domlist as $v ) {
+						if ( $v instanceof \DOMAttr ) {
+							$list[] = $v->value;
+						} elseif ( $v instanceof \DOMElement ) {
+							$list[] = $v->textContent;
+						} else {
+							$list[] = $v;
+						}
+					}
+
+					return trim( implode( '', $list ) );
+				}
+
+				return $list;
 			};
 		} elseif ( isset( $site['patch'] ) ) {
 			$script = $site['patch'];
@@ -368,17 +423,16 @@ class Scraper {
 		}
 
 		if ( $script ) {
-			if ( is_array( $obj ) ) {
+			if ( is_array( $obj ) && isset( $obj[0] ) ) {
 				$out = array();
 				if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
 					unset( $vars['out'] );
 				}
 				foreach ( $obj as $i => $el ) {
-					$v = ( isset( $site['var'] ) && '*' === $site['var'] ) ? $vars : clone $vars;
-					$v['index'] = $i;
-					$this->scan( $v, $site, $el );
+					$vars['index'] = $i;
+					$this->scan( $vars, $site, $el );
 					if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
-						$out[] = $v['out'];
+						$out[] = $vars['out'];
 					}
 				}
 				if ( ! isset( $site['var'] ) || '*' !== $site['var'] ) {
@@ -415,22 +469,19 @@ class Scraper {
 				}
 
 				$hasChildren = isset( $cmd['acceptJson'] ) || isset( $cmd['acceptText'] ) || isset( $cmd['acceptHtml'] ) || isset( $cmd['acceptXml'] ) || isset( $cmd['patch'] ) || isset( $cmd['use'] );
-				$asText = ( ! $hasChildren && ! $cmd['match'] );
+				$asText = ! $hasChildren && ! ( is_array( $cmd ) && isset( $cmd['match'] ) );
 
 				if ( '=' === $op[0] ) {
 					$val = substr( $op, 1 );
 				} elseif ( '&' === $op[0] ) {
-					$jsonObject = new jsonObject( $vars );
-					$val = $jsonObject->get( '$' . substr( $op, 1 ) );
-					if ( $asText ) {
-						$val = array_shift( $val );
-					}
+					$val = jsonPath( $vars, '$' . substr( $op, 1 ), $asText );
 				} else {
 					$val = $pathFn( $op, $asText );
 				}
 
-				if ( isset( $cmd['match'] ) ) {
-					if ( $val['match'] && preg_match( '/' . preg_quote( $cmd['match'], '/' ) . '/', $val, $match ) ) {
+				if ( is_array( $cmd ) && isset( $cmd['match'] ) ) {
+					if ( is_array( $val ) && $val['match'] && preg_match( '/' . preg_quote( $cmd['match'], '/' ) . '/', $val, $match ) ) {
+						var_dump($match);exit;
 						$val = isset( $match[1] ) ? $match[1] : $val;
 					} else {
 						continue;
@@ -446,7 +497,6 @@ class Scraper {
 				if ( $hasChildren ) {
 					if ( isset( $cmd['var'] ) ) {
 						if ( '*' !== $cmd['var'] ) {
-							$v = clone $vars; // ?
 							unset( $vars['out'] );
 						}
 					} elseif ( is_array( $val ) ) {
@@ -459,7 +509,6 @@ class Scraper {
 
 					if ( isset( $cmd['var'] ) && '*' !== $cmd['var'] ) {
 						$val = $vars['out'];
-						$vars = $v;
 					}
 				}
 
